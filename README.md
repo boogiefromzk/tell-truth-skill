@@ -25,13 +25,13 @@ This skill counteracts each of those explicitly. Six core rules:
 
 ### Option 1: paste into AI's settings
 
-#### Claude.ai
-
-Works on every Claude.ai plan including free.
+Works on every Claude.ai plan including free and Chat GPT.
 
 1. In Claude.ai, click your initials in the bottom-left corner
-2. Go to **Settings** → **Instructions for Claude**
-3. Paste the contents of [`SKILL.md`](./SKILL.md) — or just the "Core principles" section if you want to stay under the suggested 500 words
+2. Go to settings
+    * Claude: Go to **Settings** → **Instructions for Claude**
+    * Chat GPT: Go to **Settings** → **Personalization** → **Custom instructions**
+3. Paste the contents of [`SKILL.md`](./tell-truth/SKILL.md) content section
 
 It will load automatically into every new conversation.
 
