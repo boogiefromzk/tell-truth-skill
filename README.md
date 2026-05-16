@@ -23,25 +23,51 @@ This skill counteracts each of those explicitly. Six core rules:
 
 ## How to use it
 
-### Option 1: paste into AI's settings
+### Option 1 — Paste into the AI's personal settings (always on)
 
-Works on every Claude.ai plan including free and Chat GPT.
+Copy the content of `tell-truth/SKILL.md` (everything below the YAML frontmatter) and paste it into:
 
-1. In Claude.ai, click your initials in the bottom-left corner
-2. Go to settings
-    * Claude: Go to **Settings** → **Instructions for Claude**
-    * Chat GPT: Go to **Settings** → **Personalization** → **Custom instructions**
-3. Paste the contents of [`SKILL.md`](./tell-truth/SKILL.md) content section
+- **Claude.ai** (every plan, including free):
+  Click your initials (bottom-left) → **Settings** → **General** → **Instructions for Claude** box.
+- **ChatGPT**:
+  **Settings** → **Personalization** → **Custom instructions** box.
+- **Gemini, Grok, and others**: look for "Custom instructions," "System prompt," or "Personalization" in settings. Same idea.
 
-It will load automatically into every new conversation.
+It will load into every new conversation.
 
-### Option 2: Project Instructions
+### Option 2 — Install as an Agent Skill (on-demand)
 
-If you only want this behavior for specific work (e.g. research, journalism, fact-checking), create a Claude Project and paste the skill into the project's instructions instead. It will apply only within that project.
+Drop the whole `tell-truth/` directory (including directory itself) into the right location for your tool:
 
-### Option 3: as a Claude Code / Cursor Skill
+| Tool | Location | Notes |
+|---|---|---|
+| **Claude Code** | `~/.claude/skills/` (personal, all projects) or `.claude/skills/` (project, commit to repo) | Auto-detected on session start |
+| **Claude.ai / Claude apps / Cowork** | Settings → **Capabilities** → **Skills** (or Customize sidebar → Skills in Cowork) | Upload through the UI; no filesystem |
+| **Cursor** (2.4+) | `.cursor/skills/` in project root | Project-scoped only — no personal skills directory. Reload window after adding (`Cmd/Ctrl+Shift+P` → Developer: Reload Window) |
+| **OpenAI Codex CLI** | `~/.codex/skills/` | If skills aren't on by default, launch with `codex --enable skills` |
+| **VS Code + GitHub Copilot agent mode** | `.github/skills/` (project) or `~/.config/github-copilot/skills/` (global) | Requires Copilot agent mode (April 2026+) |
+| **Cross-tool repo convention** | `.agents/skills/` | Followed by Codex; the de-facto portable path |
 
-If you're using Claude Code, Cursor, Cowork, or other tool with skill support, drop the `tell-truth/` directory into your skills folder. The YAML frontmatter handles triggering.
+### Option 3 — Project-scoped instructions (always on, but only inside the project)
+
+Copy the content of `tell-truth/SKILL.md` (everything below the YAML frontmatter) and paste it into:
+
+- **Claude.ai**: create a Project → project's instructions.
+- **ChatGPT**: create a Project (or a Custom GPT) → paste into its instructions.
+- **Cursor**: add a file like `tell-truth.mdc` to `.cursor/rules/` with `alwaysApply: true` in the frontmatter.
+- **Claude Code**: add the content to a `CLAUDE.md` file at the repo root.
+- **OpenAI Codex CLI**: add the content to an `AGENTS.md` file at the repo root (or `~/.codex/AGENTS.md` for global).
+
+### Which option should I pick?
+
+| Want… | Use |
+|---|---|
+| Behavior on for everything | Option 1 |
+| Behavior on only for certain projects | Option 2 |
+| Behavior loaded only when the task matches (saves tokens, but not always on) | Option 3 |
+
+Note that in Cursor, if a rule and a skill give contradictory instructions, the rule wins — community testing has shown skills get ignored in that case. Don't encode the same instruction in both formats.
+
 
 ## License
 
