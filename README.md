@@ -81,6 +81,10 @@ frontmatter) and paste it into:
 These layer with project-level files (Option 3) when both exist — global loads 
 first, project-level overrides on conflict.
 
+## How to run experiment
+
+See [`experiment harness README.md`](./experiment/harness/README.md)`
+
 ## License
 
 MIT. Use it, fork it, modify it.
