@@ -20,7 +20,7 @@ capture bug by construction:
     blank, never reasoning text.
 
 Prompts + the SKILL block are read VERBATIM from ../PROMPTS.md (the single source: the
-skill in one fenced block, then the 23 prompts). Only ```-fenced blocks are read, so the
+skill in one fenced block, then the 30 prompts). Only ```-fenced blocks are read, so the
 grading notes in that file's prose never reach a model. Transcripts land in ../results/.
 
 Usage:
@@ -28,7 +28,7 @@ Usage:
   python run_experiment.py --list-models          # see exactly what your account can use
   python run_experiment.py --dry-run              # print the built cells, spend nothing
   python run_experiment.py --smoke                # one probe cell: confirm isolation + search
-  python run_experiment.py                        # the full sweep (7 models x 23 prompts x A/B)
+  python run_experiment.py                        # the full sweep (all models x 30 prompts x A/B)
   python run_experiment.py --models opus,kimi --prompts N4,D6   # a subset
 
 Requires: the `cursor-agent` CLI on PATH and a Cursor API key. No Python deps (stdlib only).
@@ -72,29 +72,38 @@ def _env(k, default=None):
 
 API_KEY = _env("CURSOR_API_KEY")
 CONCURRENCY = int(_env("CONCURRENCY", "6"))
-CELL_TIMEOUT = int(_env("CELL_TIMEOUT", "420"))       # seconds, per turn
+CELL_TIMEOUT = int(_env("CELL_TIMEOUT", "900"))       # seconds, per turn. 420 was too tight:
+# in run 5 gpt-5.6's heaviest CAPTURED cell took 409.5s — 10s under the old cap — and the one
+# cell that blew through it (030_X7_B) burned 3 x timeout of billed generation for zero data.
 CAPTURE_RETRIES = int(_env("CAPTURE_RETRIES", "3"))
+# A timeout is NOT an intermittent glitch — it means this model/prompt pair does not fit the
+# budget, so retrying it just re-buys the same wall-clock. Capped separately and low.
+TIMEOUT_RETRIES = int(_env("TIMEOUT_RETRIES", "1"))
+# Hard stop: abort the sweep once this many MILLION tokens have moved (0 = off). Counts all
+# four classes incl. cache, which are ~86% of the real volume. Run 5 moved 59.4M in total.
+BUDGET_MTOK = float(_env("BUDGET_MTOK", "0"))
 SANDBOX = _env("SANDBOX", "enabled")                  # enabled | disabled
 AGENT_BIN = _env("CURSOR_AGENT_BIN", "cursor-agent")
+USAGE_FILE = None                                     # set in main(): RESULTS/.usage.json
 
-# Model roster. These are run-2's max-thinking / most-recent-known slugs -- the intent
-# is MAX REASONING + NEWEST version per family. They may have moved on; the real list
-# comes from `--list-models`, and you override any of them via the MODELS env var
-# (see .env.example). gemini/composer below have no obvious "-thinking-max" suffix in
-# run 2 -- check --list-models for a higher-reasoning variant and set it in MODELS.
+# Model roster: run-5 slugs, verified against `--list-models` 2026-07-20 -- the intent
+# is MAX REASONING + NEWEST version per family (gemini/kimi expose a single tier;
+# composer's "-fast" sibling is the speed-serving variant, so plain composer-2.5 here).
+# Slugs drift between runs; re-check with `--list-models` and override via MODELS in .env.
 DEFAULT_MODELS = {
     "fable":    "claude-fable-5-thinking-max",
     "opus":     "claude-opus-4-8-thinking-max",
-    "gpt":      "gpt-5.5-extra-high",
+    "gpt":      "gpt-5.6-sol-max",
     "gemini":   "gemini-3.1-pro",
-    "grok":     "grok-4.3",
+    "grok":     "cursor-grok-4.5-high",   # Cursor self-hosts Grok; high = top reasoning tier
     "kimi":     "kimi-k2.7-code",
-    "composer": "composer-2.5-fast",
+    "composer": "composer-2.5",
+    "glm":      "glm-5.2-max",     # Zhipu GLM 5.2, max-reasoning variant (glm-5.2-high also available)
 }
 MODEL_NAMES = {
-    "fable": "Claude Fable 5", "opus": "Claude Opus 4.8", "gpt": "GPT 5.5",
-    "gemini": "Gemini 3.1 Pro", "grok": "Grok 4.3", "kimi": "Kimi K2.5",
-    "composer": "Composer 2.5",
+    "fable": "Claude Fable 5", "opus": "Claude Opus 4.8", "gpt": "GPT 5.6 Sol",
+    "gemini": "Gemini 3.1 Pro", "grok": "Grok 4.5", "kimi": "Kimi K2.7 Code",
+    "composer": "Composer 2.5", "glm": "GLM 5.2",
 }
 
 def roster() -> dict[str, str]:
@@ -116,7 +125,8 @@ def reps_for(model_key: str, prompt_id: str) -> int:
     return k if (k > 1 and prompt_id in DISCRIMINATORS and model_key in MOVERS) else 1
 
 EXPECTED_IDS = ([f"D{i}" for i in range(1, 9)] + [f"W{i}" for i in range(1, 7)]
-                + ["C1", "C2", "C3"] + [f"N{i}" for i in range(1, 7)])
+                + ["C1", "C2", "C3"] + [f"N{i}" for i in range(1, 7)]
+                + [f"X{i}" for i in range(1, 8)])   # V3 additions (run 5)
 
 def require_agent() -> str:
     """Resolve the cursor-agent binary or exit with install instructions."""
@@ -155,16 +165,108 @@ QUOTA_RE = re.compile(
 def is_quota_error(text: str) -> bool:
     return bool(text) and bool(QUOTA_RE.search(text))
 
-# Token accounting (best-effort: from the stream's usage field if the CLI reports it,
-# else estimated from output length).
+# ----------------------------------------------------------------------- token accounting
+# Run 5's token line undercounted real volume by 7.4x overall and 96.8x for gpt (it printed
+# 209,020 for gpt against 20,229,701 actually moved). Two causes, both fixed here:
+#   1. it summed ONLY inputTokens + outputTokens, ignoring cacheReadTokens / cacheWriteTokens
+#      — which are 86% of every token that moves;
+#   2. the counter was a per-PROCESS global, but the sweep is resumed across many invocations,
+#      so the last run printed only its own handful of cells (in run 5's final resume: zero).
+# Now: four token classes, per model, accumulated into RESULTS/.usage.json so a resumed sweep
+# reports the whole battery. Retried and quota-aborted attempts count too — they were billed.
+TOKCLASSES = ("in", "out", "cread", "cwrite")
 _TOK_LOCK = threading.Lock()
-_TOK = {"in": 0, "out": 0, "reported": False, "out_chars": 0}
-def _add_tokens(tin: int, tout: int, reported: bool, chars: int) -> None:
+_TOK: dict[str, dict] = {}
+_ABORT = threading.Event()          # set when BUDGET_MTOK is crossed
+
+def _blank() -> dict:
+    d = {k: 0 for k in TOKCLASSES}
+    d.update(turns=0, calls=0, tools=0, ms=0, reported=False, out_chars=0)
+    return d
+
+def _add_usage(mkey: str, pr: dict) -> None:
+    """Fold one turn's usage into the per-model ledger. Called for EVERY turn that reached the
+    provider, including ones whose transcript we then discard — those were still billed."""
     with _TOK_LOCK:
-        _TOK["in"] += tin
-        _TOK["out"] += tout
-        _TOK["reported"] = _TOK["reported"] or reported
-        _TOK["out_chars"] += chars
+        d = _TOK.setdefault(mkey, _blank())
+        for k, src in zip(TOKCLASSES, ("tin", "tout", "cread", "cwrite")):
+            d[k] += pr.get(src, 0)
+        d["turns"] += 1
+        d["tools"] += len(pr.get("tools", ()))
+        d["ms"] += pr.get("ms", 0)
+        d["reported"] = d["reported"] or pr.get("reported", False)
+        d["out_chars"] += len(pr.get("answer", "") or "")
+    if BUDGET_MTOK and total_tokens() / 1e6 > BUDGET_MTOK and not _ABORT.is_set():
+        _ABORT.set()
+        print(f"\n!! BUDGET_MTOK={BUDGET_MTOK} exceeded — no further cells will be started. "
+              f"Already-running cells finish; re-run to resume.\n", file=sys.stderr)
+
+def _load_usage() -> None:
+    """Merge the prior invocations' ledger so a resumed sweep reports the whole battery."""
+    if USAGE_FILE and USAGE_FILE.exists():
+        try:
+            for mk, d in json.loads(USAGE_FILE.read_text()).get("models", {}).items():
+                cur = _TOK.setdefault(mk, _blank())
+                for k, v in d.items():
+                    cur[k] = (cur[k] or v) if isinstance(v, bool) else cur.get(k, 0) + v
+        except (json.JSONDecodeError, OSError, TypeError):
+            pass                                   # a corrupt ledger must never block a run
+
+def _save_usage() -> None:
+    if not USAGE_FILE:
+        return
+    with _TOK_LOCK:
+        USAGE_FILE.write_text(json.dumps({"models": _TOK}, indent=2))
+
+def rebuild_usage_from_parts() -> None:
+    """Reconstruct the ledger by re-reading every .jsonl sidecar on disk. Used by --usage so a
+    battery captured before this ledger existed can still be measured. It is a FLOOR: the
+    harness only ever persisted the LAST attempt's stream, so retried and quota-aborted
+    attempts left no transcript to count."""
+    if not PARTS.is_dir():
+        return
+    for mdir in sorted(p for p in PARTS.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        for f in sorted(mdir.glob("*.jsonl")):
+            try:
+                rows = [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+            except (json.JSONDecodeError, OSError):
+                continue
+            for r in rows:
+                _add_usage(mdir.name, parse_stream(r.get("stdout", "")))
+
+def model_tokens(d: dict) -> int:
+    return sum(d.get(k, 0) for k in TOKCLASSES)
+
+def total_tokens() -> int:
+    with _TOK_LOCK:
+        return sum(model_tokens(d) for d in _TOK.values())
+
+def print_usage_report(before: int | None = None) -> None:
+    """Cumulative across every invocation that wrote RESULTS/.usage.json — the sweep is normally
+    resumed, so a per-process count is noise. Convert to money in the Cursor dashboard."""
+    with _TOK_LOCK:
+        snap = {mk: dict(d) for mk, d in _TOK.items()}
+    if not snap:
+        print("\nNo usage recorded yet.")
+        return
+    print(f"\n{'model':10s}{'turns':>6s}{'wall_min':>9s}{'output':>10s}{'cacheR':>12s}"
+          f"{'cacheW':>11s}{'input':>10s}{'tools':>7s}{'total_tok':>12s}")
+    print("-" * 87)
+    agg = _blank()
+    for mk in sorted(snap, key=lambda k: -model_tokens(snap[k])):
+        d = snap[mk]
+        print(f"{mk:10s}{d['turns']:6d}{d['ms']/60000:9.1f}{d['out']:10,d}{d['cread']:12,d}"
+              f"{d['cwrite']:11,d}{d['in']:10,d}{d['tools']:7d}{model_tokens(d):12,d}")
+        for k in list(TOKCLASSES) + ["turns", "tools", "ms"]:
+            agg[k] += d[k]
+    print("-" * 87)
+    print(f"{'TOTAL':10s}{agg['turns']:6d}{agg['ms']/60000:9.1f}{agg['out']:10,d}"
+          f"{agg['cread']:12,d}{agg['cwrite']:11,d}{agg['in']:10,d}{agg['tools']:7d}"
+          f"{model_tokens(agg):12,d}")
+    if before is not None:
+        print(f"\nThis invocation added {model_tokens(agg) - before:,} tokens. "
+              f"Ledger: {USAGE_FILE}")
+    print("Cache reads + writes are ~86% of the volume — the columns run 5 never counted.")
 
 # ----------------------------------------------------------------------------- battery
 def parse_battery() -> tuple[str, list[dict]]:
@@ -201,14 +303,32 @@ def parse_battery() -> tuple[str, list[dict]]:
     return skill, prompts
 
 # ----------------------------------------------------------------------------- CLI call
-def _classify_tool(text: str) -> tuple[bool, bool]:
-    """Classify a tool event (name or whole-event JSON blob) as web-search and/or code-exec.
-    Web search = external verification (web_search / web_fetch); NOT codebase_search (local).
-    Patterns are tool-name-ish to avoid false hits on result text."""
-    n = (text or "").lower()
-    search = bool(re.search(r"web[_\- ]?search|web[_\- ]?fetch|websearch|webfetch|read_web|browse", n))
-    exc = bool(re.search(r"run[_\- ]?terminal|terminal[_\- ]?cmd|run[_\- ]?command|"
-                         r"execute[_\- ]?command|\bshell\b|\bbash\b|interpreter", n))
+def _tool_name(ev: dict) -> str:
+    """Extract the real tool name from a stream-json tool event. Cursor's stream-json carries
+    it as the '<name>ToolCall' key inside ev['tool_call'] (webSearchToolCall, shellToolCall,
+    grepToolCall, ...); other CLI builds may use name/tool fields. Never fall back to the
+    whole event blob — payload text (a fetched page, the answer) must not name a tool."""
+    tc = ev.get("tool_call")
+    if isinstance(tc, dict):
+        for k in tc:
+            if k.endswith("ToolCall"):
+                return k[: -len("ToolCall")]
+    for k in ("name", "tool"):
+        if isinstance(ev.get(k), str) and ev[k]:
+            return ev[k]
+    msg = ev.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("name"), str):
+        return msg["name"]
+    return ""
+
+def _classify_tool(name: str) -> tuple[bool, bool]:
+    """Classify a tool NAME as web-search and/or code-exec. Names only, never event/result
+    text: a web page mentioning 'bash' or a payload line like 'Size: 101.9 KB, 402 lines'
+    must not flip provenance (or, upstream, quota) flags — that bug shelved a healthy cell.
+    Web search = external verification (webSearch/webFetch); grep/read/glob are local."""
+    n = (name or "").lower()
+    search = bool(re.search(r"websearch|web_search|webfetch|web_fetch|read_web|browse", n))
+    exc = bool(re.search(r"shell|terminal|run_command|execute|interpreter|bash", n))
     return search, exc
 
 _ISO_LOCK = threading.Lock()
@@ -273,9 +393,11 @@ def _pick_int(d: dict, *keys) -> int:
 def parse_stream(stdout: str) -> dict:
     """Extract the final answer, session id, tool provenance, and token usage from stream-json."""
     answer_parts, result_text, session = [], None, None
-    search = exc = False
+    search = exc = res_err = saw_result = False
     tools: list[str] = []
+    seen_calls: set = set()          # dedup key: the call_id shared by started/completed
     usage: dict | None = None
+    duration_ms = 0
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -294,22 +416,35 @@ def parse_stream(stdout: str) -> dict:
                 if c.get("type", "text") == "text" and c.get("text"):
                     answer_parts.append(c["text"])
         elif "tool" in (t or ""):
-            # tool name can live in several fields; scan the whole event blob so we don't
-            # miss it (Cursor puts subtype=started/completed and the name elsewhere).
-            blob = json.dumps(ev).lower()
-            name = (ev.get("name") or ev.get("tool")
-                    or (ev.get("message", {}) or {}).get("name") or ev.get("subtype") or t)
-            tools.append(str(name))
-            s, e = _classify_tool(blob)
+            # ONE logical invocation emits TWO events (subtype started + completed) sharing a
+            # call_id. Counting both doubled every tool figure in run 5 (gpt read as 1832 calls;
+            # the real number is 916). Dedup on call_id, and only when the event actually has
+            # one — a few streams emit an orphan 'completed' with no matching 'started'.
+            name = _tool_name(ev)
+            cid = ev.get("call_id") or ev.get("toolCallId") or (ev.get("tool_call") or {}).get("call_id")
+            fresh = True
+            if cid is not None:
+                fresh = cid not in seen_calls
+                seen_calls.add(cid)
+            if name and fresh:
+                tools.append(name)
+            s, e = _classify_tool(name)
             search, exc = search or s, exc or e
         elif t == "result":
+            saw_result = True
             result_text = ev.get("result") or result_text
+            duration_ms += ev.get("duration_ms") or 0
+            res_err = res_err or bool(ev.get("is_error")) or (ev.get("subtype") not in (None, "success"))
     answer = (result_text if (result_text and result_text.strip())
               else "\n".join(answer_parts)).strip()
-    tin = _pick_int(usage, "input_tokens", "prompt_tokens", "inputTokens") if usage else 0
-    tout = _pick_int(usage, "output_tokens", "completion_tokens", "outputTokens") if usage else 0
+    g = (lambda *ks: _pick_int(usage, *ks) if usage else 0)
     return {"answer": answer, "session": session, "search": search, "exec": exc,
-            "tools": tools, "tin": tin, "tout": tout, "reported": usage is not None}
+            "is_error": res_err, "saw_result": saw_result, "tools": tools, "ms": duration_ms,
+            "tin": g("input_tokens", "prompt_tokens", "inputTokens"),
+            "tout": g("output_tokens", "completion_tokens", "outputTokens"),
+            "cread": g("cache_read_input_tokens", "cacheReadTokens", "cache_read_tokens"),
+            "cwrite": g("cache_creation_input_tokens", "cacheWriteTokens", "cache_write_tokens"),
+            "reported": usage is not None}
 
 # ----------------------------------------------------------------------------- one cell
 class Cell:
@@ -333,18 +468,37 @@ def _short(text: str, n: int = 200) -> str:
     line = (text or "").strip().splitlines()
     return (line[0][:n] if line else "").strip()
 
+# Statuses whose part-file is a sentinel, not an answer: never assemble, never score, and
+# re-run on the next invocation.
+FAIL_STATUSES = ("CAPTURE_FAILED", "TIMEOUT")
+
 def _has_ok_part(cell: Cell) -> bool:
-    """A cell is 'done' if its part-file exists and is a real answer (not CAPTURE_FAILED).
-    This is what makes a re-run RESUME — already-captured cells are skipped, never re-burned."""
+    """A cell is 'done' if its part-file exists and is a real answer (not a failure sentinel).
+    This is what makes a re-run RESUME — already-captured cells are skipped, never re-burned.
+    Prefer meta.json's status over a substring scan of the answer text: the old scan asked
+    whether the model happened to type the word 'CAPTURE_FAILED' in its answer."""
     p = PARTS / cell.mkey / f"{cell.tag}.md"
-    return p.exists() and "CAPTURE_FAILED" not in p.read_text()
+    if not p.exists():
+        return False
+    meta = PARTS / cell.mkey / f"{cell.tag}.meta.json"
+    if meta.exists():
+        try:
+            return json.loads(meta.read_text()).get("status") == "OK"
+        except (json.JSONDecodeError, OSError):
+            pass
+    return not any(s in p.read_text() for s in FAIL_STATUSES)
 
 def run_cell(skill: str, cell: Cell) -> tuple[str, str]:
-    """Returns (status, reason). status in {OK, SKIP, USAGE_LIMIT, CAPTURE_FAILED}."""
+    """Returns (status, reason).
+    status in {OK, SKIP, USAGE_LIMIT, CAPTURE_FAILED, TIMEOUT, BUDGET_STOP}."""
     if _has_ok_part(cell):
         return "SKIP", ""
+    if _ABORT.is_set():
+        return "BUDGET_STOP", f"BUDGET_MTOK={BUDGET_MTOK} reached before this cell started"
     last_turns, last_raw, last_err, quota_raw = [], [], "", ""
     search = exc = hit_quota = False
+    timeouts = 0
+    attempt = 0
     for attempt in range(1, CAPTURE_RETRIES + 1):
         cwd = tempfile.mkdtemp(prefix=f"tt_{cell.mkey}_{cell.prompt['id']}_{cell.cond}_")
         turns_out, raw, session, quota = [], [], None, False
@@ -352,7 +506,19 @@ def run_cell(skill: str, cell: Cell) -> tuple[str, str]:
             for i, tt in enumerate(cell.prompt["turns"]):
                 ptext = build_prompt(skill, tt, cell.cond)
                 out, err, rc = run_turn(cell.slug, ptext, cwd, resume=session if i else None)
-                if is_quota_error(err) or is_quota_error(out):
+                pr = parse_stream(out)
+                # Count usage FIRST, unconditionally. Every branch below can discard this
+                # turn's transcript, but the provider already generated it and already billed
+                # it. Run 5 counted only the clean path, so the ~3.0M cache-read tokens burned
+                # by quota-aborted attempts (preserved in the .QUOTA.txt sentinels) and the
+                # retried attempts appeared in no total anywhere.
+                _add_usage(cell.mkey, pr)
+                # Quota only counts on a FAILED turn (non-zero rc, error result, or no answer):
+                # the stream body carries fetched web pages and the answer itself, where
+                # QUOTA_RE patterns occur benignly — a page described as "402 lines" once
+                # shelved a healthy max-thinking cell as USAGE_LIMIT and burned its retries.
+                turn_failed = rc != 0 or pr["is_error"] or not pr["answer"]
+                if turn_failed and (is_quota_error(err) or is_quota_error(out)):
                     quota = hit_quota = True
                     quota_raw = (err or out).strip()
                     global _QUOTA_MSG
@@ -363,10 +529,10 @@ def run_cell(skill: str, cell: Cell) -> tuple[str, str]:
                     break                              # retry this cell (intermittent), don't skip model
                 if err.strip():
                     last_err = _short(err)
-                pr = parse_stream(out)
+                if err.strip() == "TIMEOUT":
+                    timeouts += 1
                 session = pr["session"] or session
                 search, exc = search or pr["search"], exc or pr["exec"]
-                _add_tokens(pr["tin"], pr["tout"], pr["reported"], len(pr["answer"]))
                 turns_out.append(pr)
                 raw.append({"turn": i + 1, "rc": rc, "stderr": err[:2000],
                             "prompt": ptext, "stdout": out})
@@ -374,17 +540,38 @@ def run_cell(skill: str, cell: Cell) -> tuple[str, str]:
             shutil.rmtree(cwd, ignore_errors=True)
         if not quota:
             last_turns, last_raw = turns_out, raw
-            if turns_out and all(t["answer"] for t in turns_out):   # validation gate
+            # Validation gate. Run 5 accepted ANY non-empty text, so a stream killed mid-flight
+            # (rc=-7, no 'result' event) had its opening preamble recorded as the model's final
+            # answer and scored — 3 cells in run 5, which is a scoring error, not just a lost
+            # cell. A real completion means: the process exited 0, the CLI emitted its terminal
+            # 'result' event, and there is text.
+            complete = (turns_out and len(turns_out) == len(cell.prompt["turns"])
+                        and all(t["answer"] and t["saw_result"] for t in turns_out)
+                        and all(r["rc"] == 0 for r in raw))
+            if complete:
                 _write_cell(cell, turns_out, search, exc, raw, "OK", attempt, "")
                 return "OK", ""
-        time.sleep(min(2 ** attempt, 15))      # backoff (rides out an intermittent usage limit)
+        # A timeout is a budget verdict, not a glitch: the same model on the same prompt will
+        # take the same wall clock next time. Run 5 spent 3 x CELL_TIMEOUT on gpt/030_X7_B for
+        # zero captured data. Stop after TIMEOUT_RETRIES and say so.
+        if timeouts > TIMEOUT_RETRIES:
+            reason = (f"timed out after {timeouts} attempt(s) at CELL_TIMEOUT={CELL_TIMEOUT}s — "
+                      f"not retried further (raise CELL_TIMEOUT or drop this model/prompt pair)")
+            _write_cell(cell, last_turns, search, exc, last_raw, "TIMEOUT", attempt, reason)
+            return "TIMEOUT", reason
+        if _ABORT.is_set():
+            return "BUDGET_STOP", f"BUDGET_MTOK={BUDGET_MTOK} reached mid-cell"
+        if attempt < CAPTURE_RETRIES:
+            time.sleep(min(2 ** attempt, 15))  # backoff (rides out an intermittent usage limit)
     if hit_quota:
         d = PARTS / cell.mkey
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{cell.tag}.QUOTA.txt").write_text(quota_raw)   # full raw error, for inspection
+        # Cap it. quota_raw falls back to the whole stdout stream when stderr is empty, which
+        # in run 5 wrote 1.59 MB "error" files containing entire transcripts.
+        (d / f"{cell.tag}.QUOTA.txt").write_text(quota_raw[:8000])
         return "USAGE_LIMIT", (_short(quota_raw, 260) or "usage/rate limit (empty error body)")
-    reason = last_err or "empty final answer (no text captured)"
-    _write_cell(cell, last_turns, search, exc, last_raw, "CAPTURE_FAILED", CAPTURE_RETRIES, reason)
+    reason = last_err or "empty final answer or truncated stream (no terminal result event)"
+    _write_cell(cell, last_turns, search, exc, last_raw, "CAPTURE_FAILED", attempt, reason)
     return "CAPTURE_FAILED", reason
 
 def _write_cell(cell, turns_out, search, exc, raw, status, attempt, reason=""):
@@ -392,8 +579,11 @@ def _write_cell(cell, turns_out, search, exc, raw, status, attempt, reason=""):
     d.mkdir(parents=True, exist_ok=True)
     # answer part (assembled later into <model>.md)
     lines = [cell.marker]
-    if status == "CAPTURE_FAILED":
-        lines.append(f"[CAPTURE_FAILED after {CAPTURE_RETRIES} attempts: {reason}]")
+    if status in FAIL_STATUSES:
+        # The sentinel must be the ONLY thing in the body. Run 5 wrote the failed cell's
+        # partial text here for CAPTURE_FAILED but not consistently, and a truncated preamble
+        # that slipped through the gate got scored as a real answer.
+        lines.append(f"[{status} after {attempt} attempt(s): {reason}]")
     elif cell.prompt["two_turn"]:
         for i, t in enumerate(turns_out, 1):
             lines += [f"Turn {i}:", t["answer"], ""]
@@ -405,9 +595,17 @@ def _write_cell(cell, turns_out, search, exc, raw, status, attempt, reason=""):
     # raw sidecar (audit: every event, reasoning + tool payloads)
     (d / f"{cell.tag}.jsonl").write_text(
         "\n".join(json.dumps(r) for r in raw))
+    # tools come from the already-parsed turns (run 5 re-parsed 62 MB of stdout here purely to
+    # rebuild this list, and an older _tool_name made it write ["completed","started"] —
+    # the subtype — instead of tool names, in 156 of 240 files).
+    usage = {k: sum(t.get(src, 0) for t in turns_out)
+             for k, src in zip(TOKCLASSES, ("tin", "tout", "cread", "cwrite"))}
     (d / f"{cell.tag}.meta.json").write_text(json.dumps({
         "status": status, "attempt": attempt, "search": search, "exec": exc,
-        "tools": sorted({t for r in raw for t in parse_stream(r["stdout"])["tools"]}),
+        "tools": sorted({t for turn in turns_out for t in turn.get("tools", ())}),
+        "tool_calls": sum(len(turn.get("tools", ())) for turn in turns_out),
+        "duration_ms": sum(turn.get("ms", 0) for turn in turns_out),
+        "usage": usage,
     }, indent=2))
 
 # ----------------------------------------------------------------------------- assembly
@@ -425,7 +623,7 @@ def assemble(mkey: str, slug: str, gate: str):
     (RESULTS / f"{mkey}.md").write_text(header + body)
 
 # ----------------------------------------------------------------------------- smoke gate
-def run_smoke(slug: str) -> bool:
+def run_smoke(slug: str, mkey: str = "smoke") -> bool:
     print(f"[smoke] probing isolation + web search with {slug} ...")
     cwd = tempfile.mkdtemp(prefix="tt_smoke_")
     probe = ("List verbatim every custom rule, skill, persona, or system instruction "
@@ -438,13 +636,14 @@ def run_smoke(slug: str) -> bool:
         shutil.rmtree(cwd, ignore_errors=True)
     PARTS.mkdir(parents=True, exist_ok=True)
     (PARTS / "smoke_raw.jsonl").write_text(out or "")
-    if is_quota_error(err) or is_quota_error(out):
+    pr = parse_stream(out)
+    _add_usage(mkey, pr)          # the gate runs on every invocation and is billed like any cell
+    if (rc != 0 or pr["is_error"] or not pr["answer"]) and (is_quota_error(err) or is_quota_error(out)):
         print("  --- OUT OF CREDITS / QUOTA ---")
         print("  Cursor returned: " + (err or out).strip()[:400].replace("\n", " "))
         print("\n[smoke] FAILED: no credits/quota. Add funds or raise your spending limit in the "
               "Cursor dashboard, then retry.")
         return False
-    pr = parse_stream(out)
     ans = pr["answer"]
     low = ans.lower()
     contaminated = any(s in low for s in ("tell-truth", "investigator, not oracle",
@@ -487,13 +686,27 @@ def main():
     ap.add_argument("--skip-smoke", action="store_true", help="skip the pre-run smoke gate")
     ap.add_argument("--fresh", action="store_true",
                     help="redo every cell (default resumes: skip cells already captured OK)")
+    ap.add_argument("--yes", action="store_true", help="skip the --fresh confirmation prompt")
+    ap.add_argument("--usage", action="store_true",
+                    help="print the cumulative token ledger and exit (spends nothing)")
     ap.add_argument("--dry-run", action="store_true", help="print built cells, make no API calls")
     args = ap.parse_args()
 
-    global AGENT_BIN
+    global AGENT_BIN, USAGE_FILE
     if args.list_models:
         AGENT_BIN = require_agent()
         subprocess.run([AGENT_BIN, "--list-models"], env=os.environ)
+        return
+
+    if args.usage:
+        USAGE_FILE = RESULTS / ".usage.json"
+        _load_usage()
+        if not _TOK:      # no ledger yet (battery predates it) — recover a floor from the parts
+            print("No ledger found; reconstructing from the .jsonl sidecars on disk.\n"
+                  "NOTE: this is a FLOOR — only the last attempt of each cell was ever persisted,\n"
+                  "so retried and quota-aborted attempts are missing from these numbers.")
+            rebuild_usage_from_parts()
+        print_usage_report()
         return
 
     rmap = roster()
@@ -508,9 +721,10 @@ def main():
     if not args.dry_run and not API_KEY:
         sys.exit("ERROR: CURSOR_API_KEY not set. Copy .env.example to .env and fill it in.")
 
+    probe_key = "composer" if "composer" in rmap else next(iter(rmap))
     if args.smoke:
         AGENT_BIN = require_agent()
-        sys.exit(0 if run_smoke(rmap.get("composer") or next(iter(rmap.values()))) else 1)
+        sys.exit(0 if run_smoke(rmap[probe_key], probe_key) else 1)
 
     cells = [Cell(mk, slug, p, c, r, order[p["id"]])
              for mk, slug in rmap.items()
@@ -531,15 +745,28 @@ def main():
     AGENT_BIN = require_agent()
     gate = "smoke skipped (--skip-smoke)"
     if not args.skip_smoke:
-        probe_slug = rmap.get("composer") or next(iter(rmap.values()))
-        if not run_smoke(probe_slug):
+        if not run_smoke(rmap[probe_key], probe_key):
             sys.exit("Aborting: smoke gate failed. Fix isolation/search or pass --skip-smoke.")
         gate = "smoke PASS — no skills in context, web search fired"
 
     RESULTS.mkdir(parents=True, exist_ok=True)
     PARTS.mkdir(parents=True, exist_ok=True)
+    USAGE_FILE = RESULTS / ".usage.json"
+    _load_usage()                       # carry the ledger across resumed invocations
+    tok_before = total_tokens()
     if args.fresh:                      # --fresh: wipe prior parts for these models, redo all
-        for mk in rmap:
+        victims = [mk for mk in rmap if (PARTS / mk).is_dir()]
+        n = sum(len(list((PARTS / mk).glob("*.md"))) for mk in victims)
+        if n and not args.yes:
+            # --fresh re-buys every cell. At run-5 rates that is ~$0.60/cell for gpt, so a
+            # reflexive --fresh on the full grid is a ~$100 keystroke. Make it say so.
+            est = sum(model_tokens(_TOK.get(mk, _blank())) for mk in victims)
+            print(f"--fresh will DELETE {n} captured cell(s) across {', '.join(victims)} and "
+                  f"re-run them.\nPrior recorded volume on those models: {est:,} tokens. "
+                  f"Re-running spends roughly that again.")
+            if input("Type 'fresh' to confirm: ").strip() != "fresh":
+                sys.exit("Aborted; nothing deleted.")
+        for mk in victims:
             shutil.rmtree(PARTS / mk, ignore_errors=True)
 
     pending = cells if args.fresh else [c for c in cells if not _has_ok_part(c)]
@@ -563,7 +790,9 @@ def main():
             if status not in ("OK", "SKIP"):
                 failed.append((f"{cell.mkey}/{cell.tag}", status, reason))
             tail = f"  — {reason}" if (reason and status not in ("OK", "SKIP")) else ""
-            print(f"[{n}/{len(pending)}] {cell.mkey}/{cell.tag} -> {status}{tail}")
+            print(f"[{n}/{len(pending)}] {cell.mkey}/{cell.tag} -> {status}"
+                  f"  ({total_tokens()/1e6:.1f}M tok so far){tail}")
+            _save_usage()      # checkpoint: a Ctrl-C must not lose the spend record
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
         list(ex.map(work, pending))
@@ -572,20 +801,16 @@ def main():
         assemble(mk, slug, gate)
 
     dt = int(time.time() - t0)
+    _save_usage()
     captured = sum(1 for c in cells if _has_ok_part(c))
-    ok = done.get("OK", 0); ql = done.get("USAGE_LIMIT", 0); cf = done.get("CAPTURE_FAILED", 0)
+    ok = done.get("OK", 0); ql = done.get("USAGE_LIMIT", 0)
+    cf = done.get("CAPTURE_FAILED", 0); to = done.get("TIMEOUT", 0); bs = done.get("BUDGET_STOP", 0)
     print(f"\nDone in {dt // 60}m{dt % 60}s. This run: {ok} ok, {ql} usage-limited, "
-          f"{cf} capture-failed.  Captured on disk: {captured}/{len(cells)}.")
+          f"{cf} capture-failed, {to} timed-out, {bs} budget-stopped.  "
+          f"Captured on disk: {captured}/{len(cells)}.")
 
-    # token usage
-    if _TOK["reported"]:
-        tot = _TOK["in"] + _TOK["out"]
-        print(f"Tokens: {_TOK['in']:,} in + {_TOK['out']:,} out = {tot:,} total (reported by the CLI).")
-    else:
-        est = _TOK["out_chars"] // 4
-        print(f"Tokens: the CLI did not report usage; ~{est:,} output tokens estimated from output "
-              f"length (rough). Check actual spend in the Cursor dashboard.")
-    print(f"Per-model transcripts: {RESULTS}/<model>.md   (parts + .jsonl sidecars under {PARTS}/<model>/)")
+    print_usage_report(tok_before)
+    print(f"\nPer-model transcripts: {RESULTS}/<model>.md   (parts + .jsonl sidecars under {PARTS}/<model>/)")
 
     missing = len(cells) - captured
     if _QUOTA_MSG:
@@ -601,7 +826,7 @@ def main():
         for name, st, reason in failed:
             print(f"   {name}  [{st}]  {reason}")
     else:
-        print("\n✓ Complete: every one of the 322 cells captured.")
+        print(f"\n✓ Complete: every one of the {len(cells)} cells captured.")
     sys.exit(0 if missing == 0 else 2)
 
 

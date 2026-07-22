@@ -83,7 +83,28 @@ first, project-level overrides on conflict.
 
 ## How to run experiment
 
-See [`experiment harness README.md`](./experiment/harness/README.md)`
+The skill is A/B tested: the same trick questions asked twice per model — once alone, once with the skill in front of them — then graded against a checklist published *before* scoring, so the marking can't drift to flatter the skill. Everything needed to repeat it is in [`experiment/`](experiment/):
+
+| File | What it is |
+|---|---|
+| **[`PROMPTS.md`](experiment/PROMPTS.md)** | The prompt battery — everyday questions, professional tasks, and controls, each targeting one documented AI failure. Copy-paste to run it by hand. |
+| **[`ASSESSMENT.md`](experiment/ASSESSMENT.md)** | The scoring rubric: one checklist per prompt, the automatic-fail tripwires, and the real-world incident each trap comes from. |
+| **[`harness/`](experiment/harness/)** | A runner that does the whole sweep — one isolated session per model × prompt × condition, capturing each answer with its transcript. |
+
+Two rules make the results worth anything:
+
+1. **Tool use is read from the transcripts, never from what the answer claims.** "I verified this" proves nothing; the recorded search and code-execution events decide.
+2. **The rubric is published before scoring.** Controls are graded for side effects only — the skill changing a poem or a settled fact is a cost, never a win.
+
+Run it:
+
+```bash
+python3 experiment/harness/run_experiment.py     # resumes; only missing answers are generated
+```
+
+Needs a `CURSOR_API_KEY` in `experiment/harness/.env` (one key bills every model). `--dry-run` and `--usage` spend nothing; `--models` / `--prompts` limit the sweep; `--fresh` re-buys everything, so it asks first.
+
+Results move with every run, so no scores are quoted here. The strongest check isn't anyone's published numbers — it's running the battery on your own models and reporting where the skill fails.
 
 ## License
 
